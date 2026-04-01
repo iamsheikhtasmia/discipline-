@@ -131,13 +131,14 @@ function normalizeTask(t) {
 
 function normalizeGoal(g) {
   return {
-    id:        g.id        || uid(),
-    title:     g.title     || 'Untitled Goal',
-    desc:      g.desc      || '',
-    startDate: g.startDate || todayISO(),
-    deadline:  g.deadline  || '',
-    category:  g.category  || 'Skill',
-    createdAt: g.createdAt || Date.now(),
+    id:           g.id           || uid(),
+    title:        g.title        || 'Untitled Goal',
+    desc:         g.desc         || '',
+    startDate:    g.startDate    || todayISO(),
+    deadline:     g.deadline     || '',
+    category:     g.category     || 'Skill',
+    totalElapsed: g.totalElapsed || 0,   // accumulated across all days
+    createdAt:    g.createdAt    || Date.now(),
   };
 }
 
@@ -146,9 +147,13 @@ function normalizeGoal(g) {
    Progress = sum of elapsed from linked tasks
 ════════════════════════════════════════════ */
 function getGoalProgress(goalId) {
-  return tasks
+  // Accumulated past days + today's live elapsed
+  const goal       = getGoal(goalId);
+  const past       = goal ? (goal.totalElapsed || 0) : 0;
+  const todayLive  = tasks
     .filter(t => t.goalId === goalId)
     .reduce((sum, t) => sum + (t.elapsed || 0), 0);
+  return past + todayLive;
 }
 
 function getDaysLeft(goal) {
@@ -177,9 +182,14 @@ function calcDailyScore(overrideTasks) {
   const completed  = src.filter(t => isCompleted(t)).length;
   const failed     = src.filter(t => isFailed(t)).length;
   const streak     = loadStreak().count;
-  // +10 per complete, -5 per fail, streak bonus max +25
-  // Score CAN be negative
-  return (completed * 10) - (failed * 5) + Math.min(streak * 5, 25);
+
+  // No activity at all → score is 0, no streak bonus
+  if (completed === 0 && failed === 0) return 0;
+
+  // Streak bonus only applies when at least 1 task is completed
+  const streakBonus = completed > 0 ? Math.min(streak * 5, 25) : 0;
+
+  return (completed * 10) - (failed * 5) + streakBonus;
 }
 
 function getScoreTrend() {
@@ -769,6 +779,17 @@ function endDay() {
 
   updateStreak();
 
+  // ── Accumulate elapsed into goals BEFORE reset ──
+  goals.forEach(g => {
+    const todaySecs = tasks
+      .filter(t => t.goalId === g.id)
+      .reduce((sum, t) => sum + (t.elapsed || 0), 0);
+    if (todaySecs > 0) {
+      g.totalElapsed = (g.totalElapsed || 0) + todaySecs;
+    }
+  });
+  saveGoals(goals);
+
   // ── Reset tasks for new day AFTER report saved ──
   tasks.forEach(t => { t.elapsed = 0; t.running = false; t.comment = ''; });
   tasks = tasks.filter(t => !t.isPenalty);
@@ -1143,6 +1164,7 @@ function switchPage(name) {
   if (name==='analytics') updateAnalytics();
   if (name==='reports')   renderReports();
   if (name==='goals')     renderGoals();
+  if (name==='monk')      renderMonkMode();
 }
 
 /* ════════════════════════════════════════════
@@ -1228,6 +1250,15 @@ function silentEndDay() {
   reports.unshift(report);
 
   updateStreak();
+
+  // ── Accumulate elapsed into goals BEFORE reset ──
+  goals.forEach(g => {
+    const todaySecs = tasks
+      .filter(t => t.goalId === g.id)
+      .reduce((sum, t) => sum + (t.elapsed || 0), 0);
+    if (todaySecs > 0) g.totalElapsed = (g.totalElapsed || 0) + todaySecs;
+  });
+  saveGoals(goals);
 
   // Reset for new day
   tasks.forEach(t => { t.elapsed = 0; t.running = false; t.comment = ''; });
@@ -1349,10 +1380,324 @@ function setupEvents() {
   });
 }
 
+
+/* ════════════════════════════════════════════
+   MONK MODE
+   - Date range commitment (start → end)
+   - Daily rules: custom + preset
+   - Daily yes/no checkin per rule
+   - Guilt message if failed
+   - Streak of clean days
+════════════════════════════════════════════ */
+const KEY_MONK = 'dos_monk';
+
+function loadMonkData() {
+  try { return JSON.parse(localStorage.getItem(KEY_MONK)) || null; } catch { return null; }
+}
+function saveMonkData(data) {
+  localStorage.setItem(KEY_MONK, JSON.stringify(data));
+  // also sync to cloud profile
+  if (profile) { profile.monkMode = data; saveProfile(profile); }
+}
+
+function getMonkData() {
+  // prefer cloud profile, fallback localStorage
+  return (profile && profile.monkMode) || loadMonkData();
+}
+
+/* Default guilt messages */
+const GUILT_MESSAGES = [
+  "You broke your silence. The algorithm got you. Was it worth it?",
+  "Every scroll you didn't need brought you further from who you want to be.",
+  "The person you're becoming doesn't do this. Remember that tomorrow.",
+  "You chose distraction over discipline. Own it. Fix it.",
+  "Your future self is watching. Don't let them down again.",
+];
+
+function getGuiltMessage() {
+  return GUILT_MESSAGES[Math.floor(Math.random() * GUILT_MESSAGES.length)];
+}
+
+/* ── Render Monk Mode page ── */
+function renderMonkMode() {
+  const page = $('page-monk');
+  if (!page) return;
+
+  const monk = getMonkData();
+  const container = $('monkContainer');
+  if (!container) return;
+
+  if (!monk || !monk.active) {
+    renderMonkSetup(container);
+  } else {
+    renderMonkDashboard(container, monk);
+  }
+}
+
+/* ── Setup form (no active monk mode) ── */
+function renderMonkSetup(container) {
+  container.innerHTML = `
+    <div class="monk-setup-card">
+      <div class="monk-setup-icon">🧘</div>
+      <h2 class="monk-setup-title">Enter Monk Mode</h2>
+      <p class="monk-setup-sub">Commit to disappearing. No social media. No distractions. Just you and your work.</p>
+
+      <div class="monk-form">
+        <div class="field-row">
+          <div class="field-group">
+            <label class="field-label">Start Date</label>
+            <input type="date" id="monkStart" class="field-input" value="${todayISO()}" />
+          </div>
+          <div class="field-group">
+            <label class="field-label">End Date</label>
+            <input type="date" id="monkEnd" class="field-input" />
+          </div>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Preset Rules</label>
+          <div class="monk-preset-rules">
+            <label class="monk-rule-check"><input type="checkbox" value="no_instagram" checked /> 📵 No Instagram</label>
+            <label class="monk-rule-check"><input type="checkbox" value="no_facebook" checked /> 📵 No Facebook</label>
+            <label class="monk-rule-check"><input type="checkbox" value="no_tiktok" checked /> 📵 No TikTok</label>
+            <label class="monk-rule-check"><input type="checkbox" value="no_posting" checked /> 🚫 No posting / No story</label>
+            <label class="monk-rule-check"><input type="checkbox" value="no_youtube" /> 📺 No YouTube (entertainment)</label>
+            <label class="monk-rule-check"><input type="checkbox" value="no_gaming" /> 🎮 No gaming</label>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Custom Rules <span style="color:var(--ink-dim);font-weight:400">(one per line)</span></label>
+          <textarea id="monkCustomRules" class="field-input" rows="3" placeholder="No Netflix after 10pm&#10;Sleep by 11pm&#10;No junk food"></textarea>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Your Commitment Statement</label>
+          <input type="text" id="monkCommitment" class="field-input" placeholder="I will disappear for 90 days to become who I need to be." />
+        </div>
+
+        <button class="btn-primary monk-start-btn" id="monkStartBtn" style="width:100%;margin-top:8px;padding:14px">
+          🧘 Begin Monk Mode
+        </button>
+      </div>
+    </div>
+  `;
+
+  $('monkStartBtn')?.addEventListener('click', startMonkMode);
+}
+
+function startMonkMode() {
+  const start      = $('monkStart')?.value;
+  const end        = $('monkEnd')?.value;
+  const commitment = $('monkCommitment')?.value.trim();
+
+  if (!start || !end)   { toast('Please set start and end date.', 'warning'); return; }
+  if (end <= start)     { toast('End date must be after start date.', 'warning'); return; }
+
+  // Collect preset rules
+  const presetLabels = {
+    no_instagram: '📵 No Instagram',
+    no_facebook:  '📵 No Facebook',
+    no_tiktok:    '📵 No TikTok',
+    no_posting:   '🚫 No posting / No story',
+    no_youtube:   '📺 No YouTube (entertainment)',
+    no_gaming:    '🎮 No gaming',
+  };
+  const rules = [];
+  document.querySelectorAll('.monk-preset-rules input[type=checkbox]:checked').forEach(cb => {
+    rules.push({ id: cb.value, label: presetLabels[cb.value] || cb.value, preset: true });
+  });
+
+  // Custom rules
+  const customText = $('monkCustomRules')?.value.trim();
+  if (customText) {
+    customText.split('\n').filter(l => l.trim()).forEach((line, i) => {
+      rules.push({ id: `custom_${i}`, label: line.trim(), preset: false });
+    });
+  }
+
+  if (rules.length === 0) { toast('Add at least one rule.', 'warning'); return; }
+
+  const monk = {
+    active:     true,
+    start,
+    end,
+    commitment: commitment || '',
+    rules,
+    checkins:   {},   // { "2025-04-01": { ruleId: true/false, ... } }
+    cleanStreak: 0,
+  };
+
+  saveMonkData(monk);
+  toast('🧘 Monk Mode activated. Stay silent. Stay focused.', 'success', 5000);
+  renderMonkMode();
+}
+
+/* ── Active Monk Mode dashboard ── */
+function renderMonkDashboard(container, monk) {
+  const today      = todayISO();
+  const daysLeft   = daysBetween(today, monk.end);
+  const totalDays  = daysBetween(monk.start, monk.end);
+  const daysDone   = daysBetween(monk.start, today);
+  const timePct    = Math.min(100, Math.max(0, Math.round((daysDone / totalDays) * 100)));
+  const isExpired  = daysLeft < 0;
+  const todayCheckin = monk.checkins[today] || {};
+  const allDoneToday = monk.rules.every(r => todayCheckin[r.id] === true);
+  const anyFailToday = monk.rules.some(r => todayCheckin[r.id] === false);
+
+  // Count clean days (all rules passed)
+  const cleanDays = Object.entries(monk.checkins).filter(([date, checks]) =>
+    monk.rules.every(r => checks[r.id] === true)
+  ).length;
+
+  container.innerHTML = `
+    <!-- Header -->
+    <div class="monk-hero ${isExpired ? 'expired' : ''}">
+      <div class="monk-hero-top">
+        <div>
+          <div class="monk-hero-eyebrow">🧘 MONK MODE ${isExpired ? '— COMPLETED' : '— ACTIVE'}</div>
+          <div class="monk-hero-days">${isExpired ? '0' : daysLeft}</div>
+          <div class="monk-hero-days-label">days remaining</div>
+        </div>
+        <div class="monk-hero-right">
+          <div class="monk-stat-box">
+            <span class="monk-stat-val">${cleanDays}</span>
+            <span class="monk-stat-lbl">Clean days</span>
+          </div>
+          <div class="monk-stat-box">
+            <span class="monk-stat-val">${timePct}%</span>
+            <span class="monk-stat-lbl">Progress</span>
+          </div>
+        </div>
+      </div>
+
+      ${monk.commitment ? `<div class="monk-commitment">"${esc(monk.commitment)}"</div>` : ''}
+
+      <!-- Timeline -->
+      <div class="monk-timeline">
+        <div class="progress-track" style="height:6px;margin:12px 0 6px">
+          <div class="progress-fill" style="width:${timePct}%"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:.7rem;color:rgba(255,255,255,.4)">
+          <span>📌 ${monk.start}</span>
+          <span>${daysDone} days in of ${totalDays}</span>
+          <span>🏁 ${monk.end}</span>
+        </div>
+      </div>
+
+      ${isExpired ? `
+        <div class="monk-completed-msg">
+          🏆 You completed Monk Mode. ${cleanDays}/${totalDays} clean days. That's discipline.
+        </div>
+        <button class="btn-ghost" onclick="window._app.resetMonkMode()" style="margin-top:12px;width:100%">Start a New Monk Mode</button>
+      ` : ''}
+    </div>
+
+    <!-- Today's Checkin -->
+    ${!isExpired ? `
+    <div class="monk-checkin-card">
+      <div class="monk-checkin-header">
+        <h3>Today's Checkin</h3>
+        <span class="monk-date-badge">${today}</span>
+      </div>
+
+      <div class="monk-rules-list" id="monkRulesList">
+        ${monk.rules.map(rule => {
+          const val = todayCheckin[rule.id];
+          return `
+            <div class="monk-rule-row ${val===true?'pass':val===false?'fail':''}">
+              <span class="monk-rule-label">${esc(rule.label)}</span>
+              <div class="monk-rule-btns">
+                <button class="monk-btn yes ${val===true?'active':''}"
+                  onclick="window._app.monkCheckin('${rule.id}', true)">✓ Yes</button>
+                <button class="monk-btn no ${val===false?'active':''}"
+                  onclick="window._app.monkCheckin('${rule.id}', false)">✗ No</button>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+
+      ${anyFailToday ? `
+        <div class="monk-guilt-box">
+          <div class="monk-guilt-icon">⚠️</div>
+          <div class="monk-guilt-msg">${getGuiltMessage()}</div>
+        </div>
+      ` : allDoneToday ? `
+        <div class="monk-success-box">
+          ✅ Clean day! You stayed focused. Keep going.
+        </div>
+      ` : ''}
+    </div>
+    ` : ''}
+
+    <!-- Past checkin log -->
+    <div class="monk-log-card">
+      <h3 style="font-size:.85rem;font-weight:700;margin-bottom:12px">Daily Log</h3>
+      <div class="monk-log-grid">
+        ${generateMonkLogGrid(monk)}
+      </div>
+    </div>
+
+    ${!isExpired ? `
+    <div style="text-align:center;margin-top:16px">
+      <button class="btn-ghost-danger" onclick="window._app.resetMonkMode()" style="font-size:.75rem">
+        Exit Monk Mode
+      </button>
+    </div>` : ''}
+  `;
+}
+
+function generateMonkLogGrid(monk) {
+  const totalDays = daysBetween(monk.start, monk.end);
+  const days = [];
+  for (let i = 0; i <= Math.min(totalDays, 90); i++) {
+    const d = new Date(monk.start);
+    d.setDate(d.getDate() + i);
+    const iso = d.toISOString().slice(0, 10);
+    const checkin = monk.checkins[iso];
+    let cls = 'monk-log-day grey';
+    let title = iso + ' — no checkin';
+    if (checkin) {
+      const allPass = monk.rules.every(r => checkin[r.id] === true);
+      const anyFail = monk.rules.some(r => checkin[r.id] === false);
+      if (allPass)       { cls = 'monk-log-day green'; title = iso + ' — ✅ Clean day'; }
+      else if (anyFail)  { cls = 'monk-log-day red';   title = iso + ' — ❌ Failed'; }
+      else               { cls = 'monk-log-day amber';  title = iso + ' — partial'; }
+    }
+    days.push(`<div class="${cls}" title="${title}"></div>`);
+  }
+  return days.join('');
+}
+
+/* ── Checkin handler ── */
+function monkCheckin(ruleId, passed) {
+  const monk = getMonkData(); if (!monk) return;
+  const today = todayISO();
+  if (!monk.checkins[today]) monk.checkins[today] = {};
+  monk.checkins[today][ruleId] = passed;
+  saveMonkData(monk);
+  renderMonkMode();
+
+  if (!passed) {
+    // Show guilt message via toast
+    toast(getGuiltMessage(), 'warning', 6000);
+  }
+}
+
+function resetMonkMode() {
+  if (!confirm('Exit Monk Mode? All your progress will be saved but mode will be deactivated.')) return;
+  const monk = getMonkData();
+  if (monk) { monk.active = false; saveMonkData(monk); }
+  renderMonkMode();
+  toast('Monk Mode ended.', 'default');
+}
+
 /* ════════════════════════════════════════════
    EXPOSE TO HTML onclick handlers
 ════════════════════════════════════════════ */
 window._app = {
   openEditModal, deleteTask, handleStart, pauseTimer, resetTimer, saveField,
   openEditGoalModal, deleteGoal,
+  monkCheckin, resetMonkMode,
 };
