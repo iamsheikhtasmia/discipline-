@@ -101,7 +101,9 @@ async function bootApp() {
   checkAndApplyPenalties();
 
   setupEvents();
-  scheduleAutoEndDay();   // auto end at midnight
+  scheduleAutoEndDay();     // auto end at midnight
+  checklistMidnightReset(); // fresh checkboxes if new day
+  checkAll24hrResets();     // reset tasks that exceeded 24hr
   showLoader(false);
 }
 
@@ -115,17 +117,19 @@ function showLoader(on) {
 ════════════════════════════════════════════ */
 function normalizeTask(t) {
   return {
-    id:        t.id        || uid(),
-    name:      t.name      || 'Untitled',
-    minSecs:   Math.max(60, t.minSecs || 1800),  // minimum 1 min, never 0
-    category:  t.category  || 'Skill',
-    goalId:    t.goalId    || null,    // links to a Goal
-    goal:      t.goal      || '',      // today's daily goal text
-    comment:   t.comment   || '',
-    elapsed:   t.elapsed   || 0,
-    running:   false,
-    isPenalty: t.isPenalty || false,
-    createdAt: t.createdAt || Date.now(),
+    id:          t.id        || uid(),
+    name:        t.name      || 'Untitled',
+    minSecs:     Math.max(60, t.minSecs || 1800),
+    category:    t.category  || 'Skill',
+    goalId:      t.goalId    || null,
+    goal:        t.goal      || '',
+    comment:     t.comment   || '',
+    elapsed:     t.elapsed   || 0,
+    running:     false,
+    isPenalty:   t.isPenalty || false,
+    subtasks:    t.subtasks  || [],   // [{ id, text, done }]
+    timerStart:  t.timerStart || null, // timestamp when timer first started (for 24hr reset)
+    createdAt:   t.createdAt || Date.now(),
   };
 }
 
@@ -287,14 +291,47 @@ function _tickTask(id) {
   const t = getTask(id); if (!t) { clearInterval(timers[id]); return; }
   const anchor = timerAnchors[id]; if (!anchor) return;
   t.elapsed = Math.floor(anchor.baseElapsed + (Date.now() - anchor.startedAt) / 1000);
+
+  // 24hr auto-reset check
+  if (t.timerStart && (Date.now() - t.timerStart) >= 86400000) {
+    apply24hrReset(id);
+    return;
+  }
+
   updateTimerUI(id);
   if (t.elapsed % 30 === 0) saveTasks(tasks);
   if (activeFocusId === id) updateFocusUI(t);
 }
 
+function apply24hrReset(id) {
+  pauseTimer(id);
+  const t = getTask(id); if (!t) return;
+  t.elapsed    = 0;
+  t.running    = false;
+  t.timerStart = null;
+  // Clear done subtasks
+  if (t.subtasks) t.subtasks = t.subtasks.map(s => ({...s, done: false}));
+  saveTasks(tasks);
+  refreshCard(id);
+  updateDashboard();
+  if (activeFocusId === id) exitFocusMode();
+  toast(`⏰ "${t.name}" auto-reset after 24 hours.`, 'default', 4000);
+}
+
+/* On boot: check if any running tasks exceeded 24hr */
+function checkAll24hrResets() {
+  tasks.forEach(t => {
+    if (t.timerStart && !t.running && (Date.now() - t.timerStart) >= 86400000) {
+      apply24hrReset(t.id);
+    }
+  });
+}
+
 function startTimer(id) {
   const t = getTask(id); if (!t || t.running) return;
   t.running = true;
+  // Record when this task was first ever started (for 24hr auto-reset)
+  if (!t.timerStart) t.timerStart = Date.now();
   timerAnchors[id] = { startedAt: Date.now(), baseElapsed: t.elapsed };
   saveTasks(tasks); refreshCard(id); updateDashboard();
   timers[id] = setInterval(() => _tickTask(id), 500);
@@ -317,7 +354,8 @@ function stopTimer(id) {
 function resetTimer(id) {
   stopTimer(id);
   const t = getTask(id); if (!t) return;
-  t.elapsed = 0; t.running = false;
+  t.elapsed = 0; t.running = false; t.timerStart = null;
+  if (t.subtasks) t.subtasks = t.subtasks.map(s => ({...s, done: false}));
   saveTasks(tasks); refreshCard(id); updateDashboard();
   if (activeFocusId === id) exitFocusMode();
 }
@@ -356,6 +394,37 @@ function deleteTask(id) {
 
 function saveField(id, field, value) {
   const t = getTask(id); if (t) { t[field] = value; saveTasks(tasks); }
+}
+
+/* ════════════════════════════════════════════
+   SUBTASK HELPERS
+════════════════════════════════════════════ */
+function addSubtask(taskId) {
+  const input = $(`stin-${taskId}`);
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  const t = getTask(taskId); if (!t) return;
+  if (!t.subtasks) t.subtasks = [];
+  t.subtasks.push({ id: uid(), text, done: false });
+  input.value = '';
+  saveTasks(tasks);
+  refreshCard(taskId);
+}
+
+function toggleSubtask(taskId, subId) {
+  const t = getTask(taskId); if (!t) return;
+  const sub = t.subtasks.find(s => s.id === subId); if (!sub) return;
+  sub.done = !sub.done;
+  saveTasks(tasks);
+  refreshCard(taskId);
+}
+
+function deleteSubtask(taskId, subId) {
+  const t = getTask(taskId); if (!t) return;
+  t.subtasks = t.subtasks.filter(s => s.id !== subId);
+  saveTasks(tasks);
+  refreshCard(taskId);
 }
 
 /* ════════════════════════════════════════════
@@ -478,6 +547,35 @@ function buildCard(task) {
           value="${esc(task.goal)}"
           oninput="window._app.saveField('${task.id}','goal',this.value)" />
       </div>
+
+      <!-- Sub-tasks checklist -->
+      <div class="subtask-section" id="sub-${task.id}">
+        <div class="card-field-label" style="margin-bottom:6px">
+          Sub-tasks
+          <span class="subtask-count">${task.subtasks.filter(s=>s.done).length}/${task.subtasks.length}</span>
+        </div>
+        <div class="subtask-list">
+          ${task.subtasks.map(s => `
+            <div class="subtask-row ${s.done?'done':''}" id="str-${s.id}">
+              <button class="subtask-cb ${s.done?'checked':''}"
+                onclick="window._app.toggleSubtask('${task.id}','${s.id}')">
+                ${s.done ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' : ''}
+              </button>
+              <span class="subtask-text">${esc(s.text)}</span>
+              <button class="subtask-del" onclick="window._app.deleteSubtask('${task.id}','${s.id}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+          `).join('')}
+        </div>
+        <div class="subtask-add-row">
+          <input type="text" class="subtask-input" id="stin-${task.id}"
+            placeholder="Add sub-task…"
+            onkeydown="if(event.key==='Enter') window._app.addSubtask('${task.id}')" />
+          <button class="subtask-add-btn" onclick="window._app.addSubtask('${task.id}')">+</button>
+        </div>
+      </div>
+
       <div>
         <div class="card-field-label">Reflection</div>
         <textarea class="card-field-input" rows="2"
@@ -791,8 +889,24 @@ function endDay() {
   saveGoals(goals);
 
   // ── Reset tasks for new day AFTER report saved ──
-  tasks.forEach(t => { t.elapsed = 0; t.running = false; t.comment = ''; });
+  tasks.forEach(t => {
+    t.elapsed    = 0;
+    t.running    = false;
+    t.comment    = '';
+    t.timerStart = null;
+    // Done subtasks removed, undone stay for tomorrow
+    if (t.subtasks) t.subtasks = t.subtasks.filter(s => !s.done);
+  });
   tasks = tasks.filter(t => !t.isPenalty);
+
+  // ── Checklist: remove done items, keep undone for tomorrow ──
+  const clData = getChecklist();
+  if (clData && clData.items) {
+    clData.items = clData.items.filter(i => !i.done);
+    clData.lastReset = todayISO();
+    saveChecklist(clData);
+    if (profile) profile.checklist = clData;
+  }
 
   // ── Apply penalties IMMEDIATELY to existing tasks ──
   // (failed tasks from today get penalty time added right now)
@@ -1161,10 +1275,11 @@ function switchPage(name) {
   const pg = $(`page-${name}`); if (pg) pg.classList.add('active');
   const nl = document.querySelector(`[data-page="${name}"]`); if (nl) nl.classList.add('active');
   if (window.innerWidth <= 860) $('sidebar')?.classList.remove('open');
-  if (name==='analytics') updateAnalytics();
-  if (name==='reports')   renderReports();
-  if (name==='goals')     renderGoals();
-  if (name==='monk')      renderMonkMode();
+  if (name==='analytics')  updateAnalytics();
+  if (name==='reports')    renderReports();
+  if (name==='goals')      renderGoals();
+  if (name==='monk')       renderMonkMode();
+  if (name==='checklist')  renderChecklist();
 }
 
 /* ════════════════════════════════════════════
@@ -1261,8 +1376,23 @@ function silentEndDay() {
   saveGoals(goals);
 
   // Reset for new day
-  tasks.forEach(t => { t.elapsed = 0; t.running = false; t.comment = ''; });
+  tasks.forEach(t => {
+    t.elapsed    = 0;
+    t.running    = false;
+    t.comment    = '';
+    t.timerStart = null;
+    if (t.subtasks) t.subtasks = t.subtasks.filter(s => !s.done);
+  });
   tasks = tasks.filter(t => !t.isPenalty);
+
+  // Checklist: remove done items
+  const clData2 = getChecklist();
+  if (clData2 && clData2.items) {
+    clData2.items = clData2.items.filter(i => !i.done);
+    clData2.lastReset = todayISO();
+    saveChecklist(clData2);
+    if (profile) profile.checklist = clData2;
+  }
 
   saveTasks(tasks);
   saveReports(reports);
@@ -1693,6 +1823,140 @@ function resetMonkMode() {
   toast('Monk Mode ended.', 'default');
 }
 
+
+/* ════════════════════════════════════════════
+   DAILY CHECKLIST
+   - Items are permanent (persist across days)
+   - Checkbox state resets at midnight (new day)
+   - Optional comment per item
+   - No time tracking — just done/not done
+════════════════════════════════════════════ */
+const KEY_CHECKLIST = 'dos_checklist';
+
+function loadChecklist() {
+  try { return JSON.parse(localStorage.getItem(KEY_CHECKLIST)) || { items: [], lastReset: '' }; }
+  catch { return { items: [], lastReset: '' }; }
+}
+
+function saveChecklist(data) {
+  localStorage.setItem(KEY_CHECKLIST, JSON.stringify(data));
+  if (profile) { profile.checklist = data; saveProfile(profile); }
+}
+
+function getChecklist() {
+  return (profile && profile.checklist) || loadChecklist();
+}
+
+/* Reset checkbox states at midnight but keep items */
+function checklistMidnightReset() {
+  const data = getChecklist();
+  const today = todayISO();
+  if (data.lastReset === today) return; // already reset today
+  data.items = data.items.map(item => ({ ...item, done: false, comment: '' }));
+  data.lastReset = today;
+  saveChecklist(data);
+}
+
+function renderChecklist() {
+  const container = $('checklistContainer');
+  if (!container) return;
+
+  checklistMidnightReset(); // ensure fresh state for today
+  const data  = getChecklist();
+  const items = data.items || [];
+  const doneCount = items.filter(i => i.done).length;
+
+  container.innerHTML = `
+    <!-- Add new item -->
+    <div class="cl-add-row">
+      <input type="text" id="clNewItem" class="field-input" placeholder="Add a checklist item… e.g. Drink 4L water" style="flex:1"
+        onkeydown="if(event.key==='Enter') window._app.addChecklistItem()" />
+      <button class="btn-primary" onclick="window._app.addChecklistItem()" style="flex-shrink:0">+ Add</button>
+    </div>
+
+    <!-- Progress -->
+    ${items.length > 0 ? `
+    <div class="cl-progress">
+      <div class="cl-progress-text">
+        <span>${doneCount} of ${items.length} done</span>
+        <span style="font-family:var(--font-mono)">${items.length > 0 ? Math.round(doneCount/items.length*100) : 0}%</span>
+      </div>
+      <div class="progress-track" style="height:6px">
+        <div class="progress-fill ${doneCount===items.length&&items.length>0?'done':''}"
+          style="width:${items.length > 0 ? Math.round(doneCount/items.length*100) : 0}%"></div>
+      </div>
+    </div>
+    ` : ''}
+
+    <!-- Items list -->
+    <div class="cl-list">
+      ${items.length === 0 ? `
+        <div class="cl-empty">
+          <p>No items yet. Add things you want to do today — drink water, exercise, read, anything.</p>
+        </div>
+      ` : items.map((item, idx) => `
+        <div class="cl-item ${item.done ? 'done' : ''}">
+          <div class="cl-item-top">
+            <button class="subtask-cb ${item.done ? 'checked' : ''}"
+              onclick="window._app.toggleChecklistItem('${item.id}')">
+              ${item.done ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' : ''}
+            </button>
+            <span class="cl-item-text">${esc(item.text)}</span>
+            <div class="cl-item-actions">
+              <button class="subtask-del" onclick="window._app.deleteChecklistItem('${item.id}')" title="Remove item">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+          </div>
+          <!-- Comment field — shows when done or has comment -->
+          <div class="cl-comment-row">
+            <input type="text" class="cl-comment-input"
+              placeholder="${item.done ? 'Add a note…' : 'Comment (optional)…'}"
+              value="${esc(item.comment||'')}"
+              oninput="window._app.updateChecklistComment('${item.id}', this.value)" />
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function addChecklistItem() {
+  const input = $('clNewItem'); if (!input) return;
+  const text = input.value.trim(); if (!text) { toast('Please enter an item.', 'warning'); return; }
+  const data = getChecklist();
+  data.items.push({ id: uid(), text, done: false, comment: '', createdAt: Date.now() });
+  saveChecklist(data);
+  if (profile) profile.checklist = data;
+  input.value = '';
+  renderChecklist();
+}
+
+function toggleChecklistItem(itemId) {
+  const data = getChecklist();
+  const item = data.items.find(i => i.id === itemId); if (!item) return;
+  item.done = !item.done;
+  saveChecklist(data);
+  if (profile) profile.checklist = data;
+  renderChecklist();
+}
+
+function deleteChecklistItem(itemId) {
+  const data = getChecklist();
+  data.items = data.items.filter(i => i.id !== itemId);
+  saveChecklist(data);
+  if (profile) profile.checklist = data;
+  renderChecklist();
+}
+
+function updateChecklistComment(itemId, comment) {
+  const data = getChecklist();
+  const item = data.items.find(i => i.id === itemId); if (!item) return;
+  item.comment = comment;
+  saveChecklist(data);
+  if (profile) profile.checklist = data;
+}
+
 /* ════════════════════════════════════════════
    EXPOSE TO HTML onclick handlers
 ════════════════════════════════════════════ */
@@ -1700,4 +1964,6 @@ window._app = {
   openEditModal, deleteTask, handleStart, pauseTimer, resetTimer, saveField,
   openEditGoalModal, deleteGoal,
   monkCheckin, resetMonkMode,
+  addSubtask, toggleSubtask, deleteSubtask,
+  addChecklistItem, toggleChecklistItem, deleteChecklistItem, updateChecklistComment,
 };
