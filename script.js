@@ -836,8 +836,12 @@ function setText(id, val) { const el=$(id); if(el) el.textContent = val; }
 /* ════════════════════════════════════════════
    END DAY
 ════════════════════════════════════════════ */
-function endDay() {
+async function endDay() {
   if (tasks.length === 0) { toast('No tasks to save!', 'warning'); return; }
+
+  // Disable button to prevent double-click
+  const btn = $('endDayBtn');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
 
   // ── Pause all running timers first ──
   tasks.forEach(t => { if (t.running) pauseTimer(t.id); });
@@ -845,9 +849,7 @@ function endDay() {
   // ── Snapshot BEFORE reset ──
   const completed = tasks.filter(t => isCompleted(t));
   const failed    = tasks.filter(t => isFailed(t));
-
-  // Score calculated from snapshot (completed/failed state right now)
-  const score = calcDailyScore(tasks);
+  const score     = calcDailyScore(tasks);
 
   const report = {
     id:               uid(),
@@ -856,7 +858,7 @@ function endDay() {
     score,
     completedCount:   completed.length,
     failedCount:      failed.length,
-    penaltiesApplied: false,
+    penaltiesApplied: true,  // will apply below
     tasks: tasks.map(t => ({
       id:        t.id,
       name:      t.name,
@@ -874,7 +876,6 @@ function endDay() {
 
   reports = reports.filter(r => r.iso !== todayISO());
   reports.unshift(report);
-
   updateStreak();
 
   // ── Accumulate elapsed into goals BEFORE reset ──
@@ -882,24 +883,20 @@ function endDay() {
     const todaySecs = tasks
       .filter(t => t.goalId === g.id)
       .reduce((sum, t) => sum + (t.elapsed || 0), 0);
-    if (todaySecs > 0) {
-      g.totalElapsed = (g.totalElapsed || 0) + todaySecs;
-    }
+    if (todaySecs > 0) g.totalElapsed = (g.totalElapsed || 0) + todaySecs;
   });
-  saveGoals(goals);
 
-  // ── Reset tasks for new day AFTER report saved ──
+  // ── Reset tasks for new day ──
   tasks.forEach(t => {
     t.elapsed    = 0;
     t.running    = false;
     t.comment    = '';
     t.timerStart = null;
-    // Done subtasks removed, undone stay for tomorrow
     if (t.subtasks) t.subtasks = t.subtasks.filter(s => !s.done);
   });
   tasks = tasks.filter(t => !t.isPenalty);
 
-  // ── Checklist: remove done items, keep undone for tomorrow ──
+  // ── Checklist: remove done items ──
   const clData = getChecklist();
   if (clData && clData.items) {
     clData.items = clData.items.filter(i => !i.done);
@@ -908,23 +905,28 @@ function endDay() {
     if (profile) profile.checklist = clData;
   }
 
-  // ── Apply penalties IMMEDIATELY to existing tasks ──
-  // (failed tasks from today get penalty time added right now)
+  // ── Apply penalties to tasks ──
   let totalPenaltyMins = 0;
   failed.forEach(ft => {
     const penaltyMins = getPenaltyMins(ft.minSecs || 1800);
     totalPenaltyMins += penaltyMins;
     const liveTask = tasks.find(t => t.id === ft.id);
-    if (liveTask) {
-      liveTask.minSecs  += penaltyMins * 60;
-      liveTask.isPenalty = true;
-    }
+    if (liveTask) { liveTask.minSecs += penaltyMins * 60; liveTask.isPenalty = true; }
   });
 
-  // Mark today's report as penalties already applied (so checkAndApplyPenalties skips it)
-  report.penaltiesApplied = true;
-
-  saveTasks(tasks); saveReports(reports);
+  // ── Save EVERYTHING and WAIT for it to complete ──
+  try {
+    await Promise.all([
+      saveTasks(tasks),
+      saveReports(reports),
+      saveGoals(goals),
+    ]);
+  } catch (e) {
+    console.error('Save failed:', e);
+    toast('Save failed — check your connection.', 'error', 5000);
+    if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+    return;
+  }
 
   // ── Re-render ──
   renderTasks(); updateDashboard(); renderReports(); updateAnalytics();
@@ -935,22 +937,18 @@ function endDay() {
     : score < 0
     ? `Day saved. Score: ${score} pts — ${failed.length} task${failed.length>1?'s':''} failed. Do better tomorrow 💪`
     : `Day saved. Score: 0 pts`;
-
-  if (totalPenaltyMins > 0) {
-    msg += ` | ⚠ +${totalPenaltyMins} min penalty applied to failed tasks`;
-  }
-
+  if (totalPenaltyMins > 0) msg += ` | ⚠ +${totalPenaltyMins} min penalty added`;
   toast(msg, score >= 0 ? 'success' : 'warning', 7000);
 
-  // ── Show penalty banner if any failures ──
   if (totalPenaltyMins > 0) {
     const banner = $('penaltyBanner'), txt = $('penaltyText');
     if (banner && txt) {
       banner.classList.remove('hidden');
-      txt.textContent = `⚠ ${failed.length} task${failed.length>1?'s':''} failed today. +${totalPenaltyMins} min penalty added to those tasks. Complete them tomorrow. 💪`;
+      txt.textContent = `⚠ ${failed.length} task${failed.length>1?'s':''} failed. +${totalPenaltyMins} min penalty added. Complete them tomorrow. 💪`;
     }
   }
 
+  if (btn) { btn.disabled = false; btn.style.opacity = ''; }
   setTimeout(() => switchPage('reports'), 1600);
 }
 
@@ -1328,7 +1326,7 @@ function scheduleAutoEndDay() {
 }
 
 /* Silent end day — same as endDay() but no redirect, no toast spam */
-function silentEndDay() {
+async function silentEndDay() {
   if (tasks.length === 0) return;
 
   tasks.forEach(t => { if (t.running) pauseTimer(t.id); });
@@ -1394,8 +1392,13 @@ function silentEndDay() {
     if (profile) profile.checklist = clData2;
   }
 
-  saveTasks(tasks);
-  saveReports(reports);
+  // await all saves
+  await Promise.all([
+    saveTasks(tasks),
+    saveReports(reports),
+    saveGoals(goals),
+  ]).catch(e => console.error('silentEndDay save error:', e));
+
   renderTasks();
   updateDashboard();
 
@@ -1502,11 +1505,18 @@ function setupEvents() {
   // Unload — commit elapsed
   window.addEventListener('beforeunload', () => {
     tasks.forEach(t => {
-      const a=timerAnchors[t.id];
-      if(a) t.elapsed=Math.floor(a.baseElapsed+(Date.now()-a.startedAt)/1000);
-      if(t.running){ clearInterval(timers[t.id]); t.running=false; }
+      const a = timerAnchors[t.id];
+      if (a) t.elapsed = Math.floor(a.baseElapsed + (Date.now() - a.startedAt) / 1000);
+      if (t.running) { clearInterval(timers[t.id]); t.running = false; }
     });
-    saveTasks(tasks);
+    // Sync to localStorage immediately (Firestore is best-effort on unload)
+    localStorage.setItem('dos_tasks', JSON.stringify(tasks.map(t=>({...t,running:false}))));
+    localStorage.setItem('dos_reports', JSON.stringify(reports));
+    localStorage.setItem('dos_goals', JSON.stringify(goals));
+    // Fire async save without awaiting (page may close before it completes)
+    saveTasks(tasks).catch(()=>{});
+    saveReports(reports).catch(()=>{});
+    saveGoals(goals).catch(()=>{});
   });
 }
 
